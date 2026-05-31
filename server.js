@@ -180,7 +180,7 @@ app.post('/api/v1/auth/login', async (req, res) => {
 app.put('/api/v1/users/profile', verifyToken, async (req, res) => {
   if (req.user.role !== 'user') return res.status(403).json({ detail: 'Access denied' });
   
-  const { name, phone, emergency_contact, blood_group, medical_history } = req.body;
+  const { name, phone, emergency_contact, blood_group, medical_history, profile_image } = req.body;
   try {
     const updatedUser = await prisma.user.update({
       where: { id: req.user.id },
@@ -189,6 +189,7 @@ app.put('/api/v1/users/profile', verifyToken, async (req, res) => {
         phone,
         emergency_contact,
         blood_group,
+        profile_image,
         medical_history: medical_history ? JSON.stringify(medical_history) : undefined
       }
     });

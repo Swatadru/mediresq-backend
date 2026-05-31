@@ -17,6 +17,7 @@ model User {
   emergency_contact String?
   blood_group       String?
   medical_history   String?
+  profile_image     String?
   
   bookings          Booking[]
   
