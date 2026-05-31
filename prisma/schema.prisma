@@ -1,0 +1,93 @@
+generator client {
+  provider = "prisma-client-js"
+  engineType = "library"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+model User {
+  id                Int       @id @default(autoincrement())
+  name              String
+  email             String    @unique
+  password_hash     String
+  phone             String?
+  emergency_contact String?
+  blood_group       String?
+  medical_history   String?
+  
+  bookings          Booking[]
+  
+  createdAt         DateTime  @default(now())
+  updatedAt         DateTime  @updatedAt
+}
+
+model Driver {
+  id               Int           @id @default(autoincrement())
+  name             String
+  phone            String        @unique
+  password_hash    String
+  ambulance_type   String
+  vehicle_number   String        @unique
+  is_available     Boolean       @default(false)
+  experience_years Int?
+  languages_known  String?
+  current_lat      Float?
+  current_lng      Float?
+  profile_image    String?
+  
+  bookings         Booking[]
+  
+  createdAt        DateTime      @default(now())
+  updatedAt        DateTime      @updatedAt
+}
+
+model Booking {
+  id                        Int      @id @default(autoincrement())
+  user_id                   Int
+  driver_id                 Int?
+  status                    String
+  pickup_lat                Float
+  pickup_lng                Float
+  destination_hospital_id   String?
+  fare                      Float?
+  payment_status            String?
+  stripe_payment_intent_id  String?
+
+  user                      User     @relation(fields: [user_id], references: [id])
+  driver                    Driver?  @relation(fields: [driver_id], references: [id])
+  
+  createdAt                 DateTime @default(now())
+  updatedAt                 DateTime @updatedAt
+}
+
+model Hospital {
+  id               Int       @id @default(autoincrement())
+  name             String?
+  location_lat     Float?
+  location_lon     Float?
+  total_beds       Int?
+  available_icu    Int?
+  facilities       String?   
+  base_price       Float?
+
+  doctors          Doctor[]
+
+  @@map("hospitals")
+}
+
+model Doctor {
+  id                 Int       @id @default(autoincrement())
+  hospital_id        Int?
+  name               String?
+  specialization     String?
+  experience_years   Int?      @map("experience")
+  consultation_fee   Float?    @map("fees")
+  rating             Float?    @default(0.0)
+
+  hospital           Hospital? @relation(fields: [hospital_id], references: [id])
+
+  @@map("doctors")
+}
