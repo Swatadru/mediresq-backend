@@ -1,7 +1,6 @@
 require('dotenv').config();
 const express = require('express');
 const cors = require('cors');
-const sqlite3 = require('sqlite3').verbose();
 const path = require('path');
 const crypto = require('crypto');
 const http = require('http');
@@ -99,30 +98,18 @@ io.on('connection', (socket) => {
 });
 
 
-// Connect to SQLite DB
-const dbPath = path.resolve(__dirname, 'mediresq.db');
-const db = new sqlite3.Database(dbPath, (err) => {
-  if (err) {
-    console.error('Error opening database', err.message);
-  } else {
-    console.log('Connected to the SQLite database.');
-  }
-});
-
 // GET /api/v1/hospitals/
-app.get('/api/v1/hospitals/', (req, res) => {
-  db.all("SELECT * FROM hospitals", [], (err, rows) => {
-    if (err) {
-      res.status(500).json({ detail: err.message });
-      return;
-    }
-    // Parse JSON strings back to objects (for facilities)
-    const processedRows = rows.map(row => {
+app.get('/api/v1/hospitals/', async (req, res) => {
+  try {
+    const hospitals = await prisma.hospital.findMany();
+    const processedRows = hospitals.map(row => {
       try { row.facilities = JSON.parse(row.facilities); } catch(e) {}
       return row;
     });
     res.json(processedRows);
-  });
+  } catch (err) {
+    res.status(500).json({ detail: err.message });
+  }
 });
 
 // POST /api/v1/auth/register (User & Driver)
@@ -189,8 +176,8 @@ app.post('/api/v1/auth/login', async (req, res) => {
   }
 });
 
-// PUT /api/users/profile (Protected Route)
-app.put('/api/users/profile', verifyToken, async (req, res) => {
+// PUT /api/v1/users/profile (Protected Route)
+app.put('/api/v1/users/profile', verifyToken, async (req, res) => {
   if (req.user.role !== 'user') return res.status(403).json({ detail: 'Access denied' });
   
   const { name, phone, emergency_contact, blood_group, medical_history } = req.body;
@@ -338,59 +325,6 @@ app.put('/api/v1/bookings/:id/destination', verifyToken, async (req, res) => {
   }
 });
 
-// Legacy SQLite POST /api/v1/users/ (Register)
-app.post('/api/v1/users/', async (req, res) => {
-  const { name, phone, password, emergency_contact, blood_group, medical_history } = req.body;
-  try {
-    const hashedPassword = password ? crypto.createHash('sha256').update(password).digest('hex') : null;
-    const historyJson = medical_history ? JSON.stringify(medical_history) : '{}';
-    
-    db.run(
-      `INSERT INTO users (name, phone, emergency_contact, blood_group, medical_history, password) VALUES (?, ?, ?, ?, ?, ?)`,
-      [name, phone, emergency_contact, blood_group, historyJson, hashedPassword],
-      function(err) {
-        if (err) {
-          if (err.message.includes('UNIQUE')) {
-            return res.status(400).json({ detail: "Phone number already registered" });
-          }
-          return res.status(500).json({ detail: err.message });
-        }
-        res.json({
-          profile: {
-            id: this.lastID,
-            name, phone, emergency_contact, blood_group, medical_history
-          },
-          token: "dummy-jwt-token"
-        });
-      }
-    );
-  } catch (err) {
-    res.status(500).json({ detail: err.message });
-  }
-});
-
-// POST /api/v1/users/login (Login)
-app.post('/api/v1/users/login', (req, res) => {
-  const { phone, password } = req.body;
-  db.get("SELECT * FROM users WHERE phone = ?", [phone], async (err, user) => {
-    if (err) return res.status(500).json({ detail: err.message });
-    if (!user) return res.status(400).json({ detail: "Incorrect phone or password" });
-    
-    if (user.password) {
-      const inputHash = crypto.createHash('sha256').update(password).digest('hex');
-      if (inputHash !== user.password) {
-        return res.status(400).json({ detail: "Incorrect phone or password" });
-      }
-    }
-    
-    try { user.medical_history = JSON.parse(user.medical_history); } catch(e) {}
-    delete user.password;
-    res.json({
-      profile: user,
-      token: "dummy-jwt-token"
-    });
-  });
-});
 
 // POST /api/v1/ai/chat
 app.post('/api/v1/ai/chat', async (req, res) => {
@@ -495,50 +429,23 @@ app.post('/api/v1/ai/analyze-symptoms', async (req, res) => {
   }
 });
 
-// Legacy SQLite GET /api/v1/users/profile
-app.get('/api/v1/users/profile', verifyToken, (req, res) => {
-  db.get("SELECT * FROM users WHERE id = ?", [req.user.id], (err, user) => {
-    if (err) return res.status(500).json({ detail: err.message });
+// GET /api/v1/users/profile
+app.get('/api/v1/users/profile', verifyToken, async (req, res) => {
+  try {
+    const user = await prisma.user.findUnique({ where: { id: req.user.id } });
     if (!user) return res.status(404).json({ detail: "User not found" });
+    
     delete user.password_hash;
     try {
       if (user.medical_history) {
         user.medical_history = JSON.parse(user.medical_history);
       }
     } catch (e) {}
+    
     res.json(user);
-  });
-});
-
-// Legacy SQLite PUT /api/v1/users/profile (Update Profile)
-app.put('/api/v1/users/profile', verifyToken, (req, res) => {
-  const { name, phone, emergency_contact, blood_group, medical_history, profile_image } = req.body;
-  
-  const historyJson = medical_history ? JSON.stringify(medical_history) : null;
-
-  db.run(
-    `UPDATE users 
-     SET name = COALESCE(?, name), 
-         phone = COALESCE(?, phone),
-         emergency_contact = COALESCE(?, emergency_contact), 
-         blood_group = COALESCE(?, blood_group), 
-         medical_history = COALESCE(?, medical_history),
-         profile_image = COALESCE(?, profile_image)
-     WHERE id = ?`,
-    [name, phone, emergency_contact, blood_group, historyJson, profile_image, req.user.id],
-    function(err) {
-      if (err) return res.status(500).json({ detail: err.message });
-      if (this.changes === 0) return res.status(404).json({ detail: "User not found" });
-      
-      // Fetch the updated user
-      db.get("SELECT * FROM users WHERE id = ?", [req.user.id], (err, user) => {
-        if (err || !user) return res.json({ success: true });
-        delete user.password_hash;
-        try { if (user.medical_history) user.medical_history = JSON.parse(user.medical_history); } catch(e) {}
-        res.json(user);
-      });
-    }
-  );
+  } catch (err) {
+    res.status(500).json({ detail: err.message });
+  }
 });
 
 // GET /api/v1/hospitals/:hospital_id/doctors
