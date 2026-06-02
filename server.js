@@ -314,11 +314,50 @@ app.put('/api/v1/bookings/:id/destination', verifyToken, async (req, res) => {
       data: { destination_hospital_id: String(hospital_id) }
     });
     
-    // Broadcast to everyone (both driver and user apps) so they both update their map
-    io.emit('destination_changed', {
-      booking_id: bookingId,
-      new_hospital
+    // Target Driver's socket specifically
+    if (updatedBooking.driver_id) {
+      const driverSocket = connectedDrivers.get(parseInt(updatedBooking.driver_id));
+      if (driverSocket) {
+        io.to(driverSocket).emit('destination_updated', {
+          booking_id: bookingId,
+          new_hospital
+        });
+      } else {
+        io.emit('destination_updated', { booking_id: bookingId, new_hospital });
+      }
+    } else {
+      io.emit('destination_updated', { booking_id: bookingId, new_hospital });
+    }
+    
+    res.json(updatedBooking);
+  } catch (err) {
+    res.status(500).json({ detail: err.message });
+  }
+});
+
+// PUT /api/v1/bookings/:id/status
+app.put('/api/v1/bookings/:id/status', verifyToken, async (req, res) => {
+  if (req.user.role !== 'driver') return res.status(403).json({ detail: "Only drivers can update status" });
+  try {
+    const bookingId = parseInt(req.params.id);
+    const { status } = req.body;
+    
+    const updatedBooking = await prisma.booking.update({
+      where: { id: bookingId },
+      data: { status }
     });
+    
+    // Target Patient's socket specifically
+    if (updatedBooking.user_id) {
+      const userSocket = connectedUsers.get(parseInt(updatedBooking.user_id));
+      if (userSocket) {
+        io.to(userSocket).emit('booking_status_changed', { booking_id: bookingId, status });
+      } else {
+        io.emit('booking_status_changed', { booking_id: bookingId, status });
+      }
+    } else {
+      io.emit('booking_status_changed', { booking_id: bookingId, status });
+    }
     
     res.json(updatedBooking);
   } catch (err) {
