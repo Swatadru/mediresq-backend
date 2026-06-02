@@ -314,20 +314,11 @@ app.put('/api/v1/bookings/:id/destination', verifyToken, async (req, res) => {
       data: { destination_hospital_id: String(hospital_id) }
     });
     
-    // Target Driver's socket specifically
-    if (updatedBooking.driver_id) {
-      const driverSocket = connectedDrivers.get(parseInt(updatedBooking.driver_id));
-      if (driverSocket) {
-        io.to(driverSocket).emit('destination_updated', {
-          booking_id: bookingId,
-          new_hospital
-        });
-      } else {
-        io.emit('destination_updated', { booking_id: bookingId, new_hospital });
-      }
-    } else {
-      io.emit('destination_updated', { booking_id: bookingId, new_hospital });
-    }
+    // ALWAYS emit globally to ensure both Driver and Patient apps receive it instantly
+    io.emit('destination_updated', {
+      booking_id: bookingId,
+      new_hospital
+    });
     
     res.json(updatedBooking);
   } catch (err) {
