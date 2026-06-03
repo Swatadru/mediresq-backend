@@ -39,6 +39,7 @@ const AMBULANCE_RATES = {
 // WebSockets Setup
 const connectedUsers = new Map(); // userId -> socketId
 const connectedDrivers = new Map(); // driverId -> socketId
+const pendingBookingTimers = new Map(); // bookingId -> setTimeout ref
 
 io.on('connection', (socket) => {
   console.log('Client connected:', socket.id);
@@ -260,6 +261,32 @@ app.post('/api/v1/bookings', verifyToken, async (req, res) => {
     for (let [driverId, socketId] of connectedDrivers.entries()) {
       io.to(socketId).emit('new_emergency_request', payload);
     }
+
+    // Auto-expire booking after 90 seconds if no driver accepts
+    const expiryTimer = setTimeout(async () => {
+      try {
+        const currentBooking = await prisma.booking.findUnique({ where: { id: booking.id } });
+        if (currentBooking && currentBooking.status === 'PENDING') {
+          await prisma.booking.update({
+            where: { id: booking.id },
+            data: { status: 'EXPIRED' }
+          });
+          // Notify the user that no driver was found
+          const userSocket = connectedUsers.get(parseInt(req.user.id));
+          if (userSocket) {
+            io.to(userSocket).emit('booking_expired', { booking_id: booking.id });
+          } else {
+            io.emit('booking_expired', { booking_id: booking.id });
+          }
+          console.log(`Booking #${booking.id} expired - no driver accepted within 90s`);
+        }
+      } catch (e) {
+        console.error('Error expiring booking:', e);
+      } finally {
+        pendingBookingTimers.delete(booking.id);
+      }
+    }, 90000);
+    pendingBookingTimers.set(booking.id, expiryTimer);
     
     res.json(booking);
   } catch (err) {
@@ -277,6 +304,12 @@ app.put('/api/v1/bookings/:id/accept', verifyToken, async (req, res) => {
     if (!booking) return res.status(404).json({ detail: "Booking not found" });
     if (booking.status !== 'PENDING') return res.status(400).json({ detail: "Booking already accepted" });
     
+    // Clear the expiry timer since a driver accepted
+    if (pendingBookingTimers.has(bookingId)) {
+      clearTimeout(pendingBookingTimers.get(bookingId));
+      pendingBookingTimers.delete(bookingId);
+    }
+
     const updatedBooking = await prisma.booking.update({
       where: { id: bookingId },
       data: {
@@ -298,6 +331,73 @@ app.put('/api/v1/bookings/:id/accept', verifyToken, async (req, res) => {
     });
     
     res.json(updatedBooking);
+  } catch (err) {
+    res.status(500).json({ detail: err.message });
+  }
+});
+
+// POST /api/v1/bookings/:id/retry - Re-broadcast a PENDING/EXPIRED booking to all drivers
+app.post('/api/v1/bookings/:id/retry', verifyToken, async (req, res) => {
+  if (req.user.role !== 'user') return res.status(403).json({ detail: "Only users can retry bookings" });
+  try {
+    const bookingId = parseInt(req.params.id);
+    const booking = await prisma.booking.findUnique({ where: { id: bookingId } });
+    if (!booking) return res.status(404).json({ detail: "Booking not found" });
+    if (booking.status !== 'PENDING' && booking.status !== 'EXPIRED') {
+      return res.status(400).json({ detail: "Booking cannot be retried" });
+    }
+
+    // Reset to PENDING
+    await prisma.booking.update({
+      where: { id: bookingId },
+      data: { status: 'PENDING' }
+    });
+
+    const user = await prisma.user.findUnique({ where: { id: booking.user_id } });
+
+    const payload = {
+      booking_id: booking.id,
+      user_id: booking.user_id,
+      user_name: user ? user.name : 'Patient',
+      pickup_lat: booking.pickup_lat,
+      pickup_lng: booking.pickup_lng,
+      destination_hospital_id: booking.destination_hospital_id,
+      hospital_lat: req.body.hospital_lat || null,
+      hospital_lng: req.body.hospital_lng || null,
+      hospital_name: req.body.hospital_name || 'Nearest Hospital',
+      ambulance_type: req.body.ambulance_type || 'BLS'
+    };
+
+    // Re-broadcast to all connected drivers
+    for (let [driverId, socketId] of connectedDrivers.entries()) {
+      io.to(socketId).emit('new_emergency_request', payload);
+    }
+
+    // Restart the expiry timer
+    if (pendingBookingTimers.has(bookingId)) {
+      clearTimeout(pendingBookingTimers.get(bookingId));
+    }
+    const expiryTimer = setTimeout(async () => {
+      try {
+        const currentBooking = await prisma.booking.findUnique({ where: { id: bookingId } });
+        if (currentBooking && currentBooking.status === 'PENDING') {
+          await prisma.booking.update({ where: { id: bookingId }, data: { status: 'EXPIRED' } });
+          const userSocket = connectedUsers.get(parseInt(booking.user_id));
+          if (userSocket) {
+            io.to(userSocket).emit('booking_expired', { booking_id: bookingId });
+          } else {
+            io.emit('booking_expired', { booking_id: bookingId });
+          }
+        }
+      } catch (e) {
+        console.error('Error expiring retried booking:', e);
+      } finally {
+        pendingBookingTimers.delete(bookingId);
+      }
+    }, 90000);
+    pendingBookingTimers.set(bookingId, expiryTimer);
+
+    res.json({ success: true, booking_id: bookingId });
   } catch (err) {
     res.status(500).json({ detail: err.message });
   }
