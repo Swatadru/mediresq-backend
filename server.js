@@ -799,6 +799,205 @@ app.post('/api/v1/payments/webhook', async (req, res) => {
   res.json({received: true});
 });
 
+// ==========================================
+// LOCATION SEARCH API PROXY
+// Strategy: Google Places → Nominatim fallback
+// Ensures India-only results + GPS-based biasing
+// ==========================================
+
+const GOOGLE_MAPS_API_KEY = process.env.GOOGLE_MAPS_API_KEY || '';
+
+// Helper: Try Google Places Autocomplete (legacy)
+async function googlePlacesAutocomplete(input, lat, lng, type) {
+  if (!GOOGLE_MAPS_API_KEY) return null;
+
+  const params = new URLSearchParams({
+    input: input.trim(),
+    key: GOOGLE_MAPS_API_KEY,
+    components: 'country:in',
+  });
+
+  if (!isNaN(lat) && !isNaN(lng)) {
+    params.set('location', `${lat},${lng}`);
+    params.set('radius', '50000');
+  }
+
+  if (type === 'hospital') {
+    params.set('types', 'hospital');
+  }
+
+  const url = `https://maps.googleapis.com/maps/api/place/autocomplete/json?${params.toString()}`;
+  const response = await fetch(url);
+  if (!response.ok) return null;
+
+  const data = await response.json();
+  if (data.status !== 'OK' && data.status !== 'ZERO_RESULTS') {
+    console.warn('Google Places status:', data.status, data.error_message || '');
+    return null; // Trigger fallback
+  }
+
+  return (data.predictions || []).map((prediction) => ({
+    placeId: prediction.place_id || '',
+    name: prediction.structured_formatting?.main_text || prediction.description?.split(',')[0] || '',
+    address: prediction.structured_formatting?.secondary_text || prediction.description || '',
+  }));
+}
+
+// Helper: Nominatim Autocomplete fallback (free, India-restricted)
+async function nominatimAutocomplete(input, lat, lng, type) {
+  const searchQuery = type === 'hospital' ? `${input.trim()} hospital` : input.trim();
+  const params = new URLSearchParams({
+    q: searchQuery,
+    format: 'json',
+    limit: '6',
+    addressdetails: '1',
+    countrycodes: 'in', // India-only restriction
+  });
+
+  // Add viewbox bias if GPS coordinates are available (±0.5 degrees ≈ ~50km)
+  if (!isNaN(lat) && !isNaN(lng)) {
+    const delta = 0.5;
+    params.set('viewbox', `${lng - delta},${lat - delta},${lng + delta},${lat + delta}`);
+    params.set('bounded', '0'); // Prefer viewbox but don't strictly limit
+  }
+
+  const url = `https://nominatim.openstreetmap.org/search?${params.toString()}`;
+  const response = await fetch(url, {
+    headers: { 'User-Agent': 'MediResQ-App/1.0', 'Accept': 'application/json' },
+  });
+
+  if (!response.ok) return [];
+
+  const data = await response.json();
+  return data.map((item, idx) => ({
+    placeId: `nominatim_${item.place_id || idx}`,
+    name: item.display_name?.split(',').slice(0, 2).join(', ') || '',
+    address: item.display_name?.split(',').slice(2, 5).join(', ') || '',
+    // Embed lat/lng directly so we don't need a separate details call
+    latitude: parseFloat(item.lat),
+    longitude: parseFloat(item.lon),
+  }));
+}
+
+// GET /api/v1/places/autocomplete
+// Query params: input (required), lat, lng, type (optional: 'hospital')
+app.get('/api/v1/places/autocomplete', async (req, res) => {
+  const { input, lat, lng, type } = req.query;
+
+  if (!input || typeof input !== 'string' || input.trim().length < 2) {
+    return res.json([]);
+  }
+
+  const latitude = parseFloat(lat);
+  const longitude = parseFloat(lng);
+
+  try {
+    // Strategy 1: Try Google Places
+    const googleResults = await googlePlacesAutocomplete(input, latitude, longitude, type);
+    if (googleResults !== null) {
+      return res.json(googleResults);
+    }
+
+    // Strategy 2: Fallback to Nominatim (always works, free)
+    console.log('Google Places unavailable, using Nominatim fallback');
+    const nominatimResults = await nominatimAutocomplete(input, latitude, longitude, type);
+    return res.json(nominatimResults);
+  } catch (err) {
+    console.error('Places autocomplete proxy error:', err);
+    // Last resort: try Nominatim even if Google threw
+    try {
+      const fallbackResults = await nominatimAutocomplete(input, latitude, longitude, type);
+      return res.json(fallbackResults);
+    } catch (fallbackErr) {
+      return res.status(500).json({ detail: 'Location search failed' });
+    }
+  }
+});
+
+// Helper: Google Places Details
+async function googlePlaceDetails(placeId) {
+  if (!GOOGLE_MAPS_API_KEY) return null;
+
+  const params = new URLSearchParams({
+    place_id: placeId,
+    fields: 'place_id,name,formatted_address,geometry',
+    key: GOOGLE_MAPS_API_KEY,
+  });
+
+  const url = `https://maps.googleapis.com/maps/api/place/details/json?${params.toString()}`;
+  const response = await fetch(url);
+  if (!response.ok) return null;
+
+  const data = await response.json();
+  if (data.status !== 'OK') {
+    console.warn('Google Place Details status:', data.status, data.error_message || '');
+    return null;
+  }
+
+  const result = data.result;
+  return {
+    placeId: result.place_id || placeId,
+    name: result.name || '',
+    address: result.formatted_address || '',
+    latitude: result.geometry?.location?.lat || 0,
+    longitude: result.geometry?.location?.lng || 0,
+  };
+}
+
+// Helper: Nominatim lookup by place ID (for Nominatim-sourced results)
+async function nominatimPlaceDetails(placeId) {
+  // Extract the numeric Nominatim place_id from our prefixed format
+  const numericId = placeId.replace('nominatim_', '');
+
+  const url = `https://nominatim.openstreetmap.org/lookup?osm_ids=N${numericId},W${numericId},R${numericId}&format=json&addressdetails=1`;
+  const response = await fetch(url, {
+    headers: { 'User-Agent': 'MediResQ-App/1.0', 'Accept': 'application/json' },
+  });
+
+  if (!response.ok || !response) return null;
+
+  const data = await response.json();
+  if (data.length > 0) {
+    const item = data[0];
+    return {
+      placeId: placeId,
+      name: item.display_name?.split(',').slice(0, 2).join(', ') || '',
+      address: item.display_name || '',
+      latitude: parseFloat(item.lat) || 0,
+      longitude: parseFloat(item.lon) || 0,
+    };
+  }
+  return null;
+}
+
+// GET /api/v1/places/details
+// Query params: placeId (required)
+app.get('/api/v1/places/details', async (req, res) => {
+  const { placeId } = req.query;
+
+  if (!placeId || typeof placeId !== 'string') {
+    return res.status(400).json({ detail: 'placeId is required' });
+  }
+
+  try {
+    // If it's a Nominatim-sourced placeId, use Nominatim lookup
+    if (placeId.startsWith('nominatim_')) {
+      const result = await nominatimPlaceDetails(placeId);
+      if (result) return res.json(result);
+      return res.status(404).json({ detail: 'Place not found' });
+    }
+
+    // Otherwise try Google Places Details
+    const googleResult = await googlePlaceDetails(placeId);
+    if (googleResult) return res.json(googleResult);
+
+    return res.status(404).json({ detail: 'Place details not found' });
+  } catch (err) {
+    console.error('Places details proxy error:', err);
+    res.status(500).json({ detail: err.message || 'Places details failed' });
+  }
+});
+
 const PORT = process.env.PORT || 8000;
 server.listen(PORT, '0.0.0.0', () => {
   console.log(`Server running on http://0.0.0.0:${PORT}`);
